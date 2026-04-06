@@ -1,45 +1,64 @@
 # NTP_2
 
-`NTP_2` is a small PlatformIO project for an ESP32 that synchronizes time over Wi-Fi using NTP and forwards the current timestamp to a Teensy over UART.
+`NTP_2` is the ESP32-side companion firmware for `myMatrixClock2`.
+It synchronizes local Berlin time over Wi-Fi via NTP and forwards validated
+timestamps to the Teensy over a custom bit-banged SPI link.
 
-The project is intended as a dedicated network time provider:
+## Features
 
-- connect to a configured Wi-Fi network
-- try a list of NTP servers until a valid time is received
-- send the timestamp to the Teensy in `YYYY-MM-DD HH:MM:SS` format
-- print debug information on USB serial
-- retry synchronization if NTP is not available
-- shut Wi-Fi down after a successful sync to reduce unnecessary activity
+- Wi-Fi based NTP synchronization on ESP32
+- Berlin timezone handling with automatic `CET` / `CEST`
+- custom 32-byte SPI frame transport to the Teensy
+- one immediate transfer after successful sync
+- further automatic transfers only when the minute changes
+- USB serial monitor commands for manual sends and regression tests
+- reply/status polling from the Teensy (`0x01`, `0x02`, `0x03`)
+
+## Repository Layout
+
+- `src/ntp_2.cpp`
+  Main firmware for Wi-Fi, NTP, SPI transfer, and serial command handling.
+- `include/credential.h`
+  Local Wi-Fi credentials, intentionally ignored by git.
+- `include/credential.example.h`
+  Safe template for creating `credential.h`.
+- `platformio.ini`
+  PlatformIO environment for `esp32dev`.
 
 ## Hardware
 
 - ESP32 development board (`board = esp32dev`)
+- Wi-Fi access to one of the configured NTP servers
 - USB connection for flashing and serial monitoring
-- UART connection from ESP32 `TX=17` to Teensy RX
-- UART connection from ESP32 `RX=16` to Teensy TX if needed
-- common GND between ESP32 and Teensy
+- SPI wiring to the Teensy clock firmware
 
-## Software Stack
+### SPI Wiring
 
-- PlatformIO
-- Arduino framework for ESP32
-- Library dependency:
-  - `arduino-libraries/NTPClient`
+Current ESP32 pin assignment:
 
-Note: the current implementation uses the ESP32 time API from `time.h` for the actual synchronization flow.
+- ESP32 `GPIO5`  -> Teensy `CS`
+- ESP32 `GPIO23` -> Teensy `SIN`
+- ESP32 `GPIO19` <- Teensy `SOUT`
+- ESP32 `GPIO18` -> Teensy `CLK`
+- common `GND`
 
-## Project Structure
+### Time Transfer Format
 
-- `src/ntp_2.cpp`
-  Main application logic for Wi-Fi connection, NTP synchronization, UART transfer, and USB debug output.
-- `include/credential.h`
-  Local Wi-Fi credentials. This file is ignored by git and must not contain production secrets in a public repository.
-- `platformio.ini`
-  PlatformIO environment configuration for the ESP32 target.
+The ESP32 sends timestamps as ASCII:
+
+```text
+YYYY-MM-DD HH:MM:SS
+```
+
+These bytes are packed into a fixed 32-byte SPI frame:
+
+- bytes `0..18`: timestamp text
+- byte `19`: null terminator
+- remaining bytes: zero padding
 
 ## Configuration
 
-The project expects a local file:
+Create a local credentials file from the template:
 
 ```cpp
 // include/credential.h
@@ -47,28 +66,47 @@ const char* ssid = "your-wifi-name";
 const char* password = "your-wifi-password";
 ```
 
-This file is already excluded in `.gitignore`.
+`include/credential.h` stays ignored by git.
 
 ## Runtime Behavior
 
 At startup the firmware:
 
 1. starts USB serial at `115200`
-2. starts UART2 at `115200` on pins `RX=16` and `TX=17`
+2. configures the custom SPI GPIO lines
 3. connects to Wi-Fi
-4. tries the configured NTP servers one by one
-5. validates the received time
-6. sends the timestamp to the Teensy over UART
-7. prints detailed debug output over USB serial
-8. disables Wi-Fi after a successful sync
+4. tries the configured NTP servers until one returns valid local time
+5. sends the current local timestamp to the Teensy
+6. keeps servicing time locally and sends again only on minute change
 
-After a successful sync, the firmware continues to print and transmit the current local time once per second.
+If sync fails, the firmware retries after `30` seconds.
 
-If synchronization fails, it retries every 30 seconds while Wi-Fi is connected.
+## Serial Monitor Commands
+
+The ESP32 monitor supports:
+
+- `help`
+- `now`
+- `test`
+- `test <name>`
+- `invalid`
+- `send <YYYY-MM-DD HH:MM:SS>`
+
+The canned tests currently include:
+
+- `winter`
+- `summer`
+- `dst-start-before`
+- `dst-start-at`
+- `dst-end-before`
+- `dst-end-at`
+- `invalid-date`
+- `invalid-format`
+- `invalid-terminator`
 
 ## NTP Servers
 
-The current firmware tries these servers in order:
+The firmware tries these servers in order:
 
 - `fritz.box`
 - `0.europe.pool.ntp.org`
@@ -76,75 +114,23 @@ The current firmware tries these servers in order:
 - `0.pool.ntp.org`
 - `1.pool.ntp.org`
 
-## Time Handling
+## Build
 
-Current configuration in the source:
-
-- GMT offset: `0`
-- daylight saving offset: `3600`
-- minimum valid year: `2024`
-
-The code formats the UART transfer string as:
-
-```text
-YYYY-MM-DD HH:MM:SS
-```
-
-Each transmitted line is terminated with `CRLF`.
-
-## Build and Upload
-
-From the project directory:
+From the repository root:
 
 ```bash
-pio run
-pio run --target upload
-pio device monitor
+pio run -e esp32dev
 ```
 
-Current `platformio.ini` defaults:
+The current `platformio.ini` contains local `upload_port` and `monitor_port`
+settings (`COM8`). Adjust them to match your system before flashing.
 
-- board: `esp32dev`
-- upload port: `COM8`
-- monitor port: `COM8`
-- monitor speed: `115200`
+## Notes For GitHub
 
-Adjust the COM port if your ESP32 appears on a different device.
+- Wi-Fi credentials are excluded from version control
+- generated PlatformIO build artifacts are ignored
+- the project no longer depends on `NTPClient`; synchronization uses the ESP32
+  `time.h` API directly
 
-## Serial Debug Output
-
-USB serial output includes messages such as:
-
-- Wi-Fi connection progress
-- assigned IP address
-- NTP server attempts
-- successful NTP source
-- transmitted time string
-- parsed local time fields
-- retry notices if synchronization fails
-
-## UART Output to Teensy
-
-The ESP32 sends the current timestamp through `Serial2` at `115200` baud.
-
-Current pin mapping:
-
-- ESP32 `TX = 17`
-- ESP32 `RX = 16`
-
-Expected line format:
-
-```text
-2026-03-29 11:23:45
-```
-
-## Notes
-
-- `include/credential.h` should stay private.
-- For GitHub publication, consider replacing the real credential file with a sample such as `include/credential.example.h`.
-- The source currently includes the original Rui Santos license header comment at the top of `src/ntp_2.cpp`.
-
-## License
-
-The repository does not currently contain a dedicated top-level license file.
-Please add one before publishing if you want the GitHub project to have an explicit license.
+If you want the repository to show an explicit license on GitHub, add a
+top-level `LICENSE` file before publishing.

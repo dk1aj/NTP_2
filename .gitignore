@@ -1,5 +1,8 @@
-.pioenvs
-.piolibdeps
+.pio/
+.pioenvs/
+.piolibdeps/
 .clang_complete
 .gcc-flags.json
+.sconsign.dblite
+.vscode/c_cpp_properties.json
 include/credential.h
