@@ -1,136 +1,78 @@
 # NTP_2
 
-`NTP_2` is the ESP32-side companion firmware for `myMatrixClock2`.
-It synchronizes local Berlin time over Wi-Fi via NTP and forwards validated
-timestamps to the Teensy over a custom bit-banged SPI link.
+## Purpose
 
-## Features
+`NTP_2` is the ESP32 time source for the companion Teensy matrix clock.
+It gets local CET/CEST time from NTP, synchronizes once per minute, and sends
+the time to the Teensy. If an NTP attempt fails, the ESP32 keeps using its
+running system clock and marks that minute as not freshly synchronized.
 
-- Wi-Fi based NTP synchronization on ESP32
-- Berlin timezone handling with automatic `CET` / `CEST`
-- custom 32-byte SPI frame transport to the Teensy
-- one immediate transfer after successful sync
-- further automatic transfers only when the minute changes
-- USB serial monitor commands for manual sends and regression tests
-- reply/status polling from the Teensy (`0x01`, `0x02`, `0x03`)
+Time path:
 
-## Repository Layout
+```text
+NTP -> ESP32 local CET/CEST time -> Teensy
+```
 
-- `src/ntp_2.cpp`
-  Main firmware for Wi-Fi, NTP, SPI transfer, and serial command handling.
-- `include/credential.h`
-  Local Wi-Fi credentials, intentionally ignored by git.
-- `include/credential.example.h`
-  Safe template for creating `credential.h`.
-- `platformio.ini`
-  PlatformIO environment for `esp32dev`.
+The timezone rule is:
+
+```text
+CET-1CEST,M3.5.0/2,M10.5.0/3
+```
 
 ## Hardware
 
-- ESP32 development board (`board = esp32dev`)
-- Wi-Fi access to one of the configured NTP servers
-- USB connection for flashing and serial monitoring
-- SPI wiring to the Teensy clock firmware
+- ESP32
+- Wi-Fi connection
+- SPI-like link to the Teensy
 
-### SPI Wiring
+| Signal | ESP32 pin |
+| --- | ---: |
+| CS | GPIO 5 |
+| MOSI | GPIO 23 |
+| MISO | GPIO 19 |
+| CLK | GPIO 18 |
 
-Current ESP32 pin assignment:
+## Time frame
 
-- ESP32 `GPIO5`  -> Teensy `CS`
-- ESP32 `GPIO23` -> Teensy `SIN`
-- ESP32 `GPIO19` <- Teensy `SOUT`
-- ESP32 `GPIO18` -> Teensy `CLK`
-- common `GND`
+The software-driven link uses a fixed 32-byte frame:
 
-### Time Transfer Format
+| Byte | Content |
+| --- | --- |
+| 0..18 | `YYYY-MM-DD HH:MM:SS` |
+| 19 | `0x00` terminator |
+| 20 | NTP status |
+| 21 | Sequence ID |
+| 22 | Timezone status |
+| 23..31 | `0x00` |
 
-The ESP32 sends timestamps as ASCII:
+Byte 20:
 
-```text
-YYYY-MM-DD HH:MM:SS
-```
+- `0x00`: NTP failed; ESP32 system time was used
+- `0x01`: fresh NTP synchronization succeeded
 
-These bytes are packed into a fixed 32-byte SPI frame:
+Byte 22:
 
-- bytes `0..18`: timestamp text
-- byte `19`: null terminator
-- remaining bytes: zero padding
+- `0x01`: CET / UTC+1
+- `0x02`: CEST / UTC+2
 
-## Configuration
+The Teensy returns an ACK status and the related Sequence ID. An update is
+accepted only when the ACK is successful and its Sequence ID matches the sent
+frame.
 
-Create a local credentials file from the template:
+## Configuration and build
 
-```cpp
-// include/credential.h
-const char* ssid = "your-wifi-name";
-const char* password = "your-wifi-password";
-```
+- PlatformIO environment: `esp32dev`
+- Main source: `src/ntp_2.cpp`
+- Current upload and monitor port: `COM16`
 
-`include/credential.h` stays ignored by git.
-
-## Runtime Behavior
-
-At startup the firmware:
-
-1. starts USB serial at `115200`
-2. configures the custom SPI GPIO lines
-3. connects to Wi-Fi
-4. tries the configured NTP servers until one returns valid local time
-5. sends the current local timestamp to the Teensy
-6. keeps servicing time locally and sends again only on minute change
-
-If sync fails, the firmware retries after `30` seconds.
-
-## Serial Monitor Commands
-
-The ESP32 monitor supports:
-
-- `help`
-- `now`
-- `test`
-- `test <name>`
-- `invalid`
-- `send <YYYY-MM-DD HH:MM:SS>`
-
-The canned tests currently include:
-
-- `winter`
-- `summer`
-- `dst-start-before`
-- `dst-start-at`
-- `dst-end-before`
-- `dst-end-at`
-- `invalid-date`
-- `invalid-format`
-- `invalid-terminator`
-
-## NTP Servers
-
-The firmware tries these servers in order:
-
-- `fritz.box`
-- `0.europe.pool.ntp.org`
-- `1.europe.pool.ntp.org`
-- `0.pool.ntp.org`
-- `1.pool.ntp.org`
-
-## Build
-
-From the repository root:
+Create `include/credential.h` from `include/credential.example.h` and add the
+local Wi-Fi credentials. The real credential file is ignored by Git.
 
 ```bash
 pio run -e esp32dev
+pio run -e esp32dev -t upload
 ```
 
-The current `platformio.ini` contains local `upload_port` and `monitor_port`
-settings (`COM8`). Adjust them to match your system before flashing.
+## Related project
 
-## Notes For GitHub
-
-- Wi-Fi credentials are excluded from version control
-- generated PlatformIO build artifacts are ignored
-- the project no longer depends on `NTPClient`; synchronization uses the ESP32
-  `time.h` API directly
-
-If you want the repository to show an explicit license on GitHub, add a
-top-level `LICENSE` file before publishing.
+The receiving Teensy firmware is in `../myMatrixClock2`.

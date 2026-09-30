@@ -40,6 +40,8 @@ The Teensy and this ESP32 form one combined system.
 9. Avoid blocking behaviour where practical.
 10. Explain changes in plain language.
 11. Compile after code changes.
+12. Flash the affected device after every firmware-affecting code or
+    configuration change.
 
 ---
 
@@ -195,6 +197,12 @@ After code changes run the normal PlatformIO build for:
 env:esp32dev
 ```
 
+After a successful build, upload the firmware to:
+
+```text
+ESP32: COM16
+```
+
 For changes affecting communication, timestamps or synchronization, also build:
 
 ```text
@@ -202,9 +210,20 @@ For changes affecting communication, timestamps or synchronization, also build:
 env:teensy31
 ```
 
+For those cross-project changes, flash both devices one after the other:
+
+```text
+Teensy: COM19 first
+ESP32:  COM16 second
+```
+
+A coding task is not complete until all required uploads succeed.
+Documentation-only changes do not require a firmware build or upload.
+
 Report:
 
 - build result
+- upload result
 - warnings introduced by the change
 - RAM use
 - Flash use

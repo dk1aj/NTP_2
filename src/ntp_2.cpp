@@ -32,8 +32,11 @@ constexpr size_t kSpiTimeFrameSize = 32;
 constexpr size_t kSpiTimeTextLength = 19;
 constexpr size_t kSpiNtpStatusIndex = 20;
 constexpr size_t kSpiSequenceIndex = 21;
+constexpr size_t kSpiUtcOffsetStatusIndex = 22;
 constexpr uint8_t kNtpStatusFailed = 0x00;
 constexpr uint8_t kNtpStatusSynchronized = 0x01;
+constexpr uint8_t kUtcOffsetStatusCet = 0x01;
+constexpr uint8_t kUtcOffsetStatusCest = 0x02;
 constexpr unsigned long kNtpServerAttemptTimeoutMs = 2000;
 constexpr char kSpiStatusPollMarker[] = "STATUS?";
 constexpr size_t kSpiStatusPollMarkerLength = sizeof(kSpiStatusPollMarker) - 1;
@@ -79,17 +82,24 @@ struct SpiTimestampTestCase
 {
     const char *name;
     const char *timestamp;
+    uint8_t utcOffsetStatus;
 };
 
 const SpiTimestampTestCase kSpiTimestampTests[] =  {
-    {"winter", "2026-01-15 12:00:00"},
-    {"summer", "2026-07-15 12:00:00"},
-    {"dst-start-before", "2026-03-29 01:59:59"},
-    {"dst-start-at", "2026-03-29 02:00:00"},
-    {"dst-end-before", "2026-10-25 02:59:59"},
-    {"dst-end-at", "2026-10-25 03:00:00"},
-    {"invalid-date", "2026-02-30 12:00:00"},
-    {"invalid-format", "2026/01/15 12:00:00"},
+    {"winter", "2026-01-15 12:00:00", kUtcOffsetStatusCet},
+    {"summer", "2026-07-15 12:00:00", kUtcOffsetStatusCest},
+    {"dst-start-before", "2026-03-29 01:59:00", kUtcOffsetStatusCet},
+    {"dst-start-at", "2026-03-29 03:00:00", kUtcOffsetStatusCest},
+    {"dst-end-cest-0159", "2026-10-25 01:59:00", kUtcOffsetStatusCest},
+    {"dst-end-cest-0200", "2026-10-25 02:00:00", kUtcOffsetStatusCest},
+    {"dst-end-cest-0230", "2026-10-25 02:30:00", kUtcOffsetStatusCest},
+    {"dst-end-cest-0259", "2026-10-25 02:59:00", kUtcOffsetStatusCest},
+    {"dst-end-cet-0200", "2026-10-25 02:00:00", kUtcOffsetStatusCet},
+    {"dst-end-cet-0230", "2026-10-25 02:30:00", kUtcOffsetStatusCet},
+    {"dst-end-cet-0259", "2026-10-25 02:59:00", kUtcOffsetStatusCet},
+    {"dst-end-cet-0300", "2026-10-25 03:00:00", kUtcOffsetStatusCet},
+    {"invalid-date", "2026-02-30 12:00:00", kUtcOffsetStatusCet},
+    {"invalid-format", "2026/01/15 12:00:00", kUtcOffsetStatusCet},
 };
 
 const size_t kSpiTimestampTestCount = sizeof(kSpiTimestampTests) / sizeof(kSpiTimestampTests[0]);
@@ -233,7 +243,11 @@ void beginTeensySpi()
  * The returned byte is the status-poll result, not merely the last byte seen
  * during the payload transfer.
  */
-SpiAck sendTimeToTeensy(const char *timestamp, bool ntpSynchronized, uint8_t sequenceId)
+SpiAck sendTimeToTeensy(
+    const char *timestamp,
+    bool ntpSynchronized,
+    uint8_t sequenceId,
+    uint8_t utcOffsetStatus)
 {
     uint8_t frame[kSpiTimeFrameSize] = {};
     copyBoundedTextToFrame(frame, sizeof(frame), timestamp, kSpiTimeTextLength);
@@ -242,6 +256,7 @@ SpiAck sendTimeToTeensy(const char *timestamp, bool ntpSynchronized, uint8_t seq
         ? kNtpStatusSynchronized
         : kNtpStatusFailed;
     frame[kSpiSequenceIndex] = sequenceId;
+    frame[kSpiUtcOffsetStatusIndex] = utcOffsetStatus;
 
     transferFrameToTeensy(frame, kSpiTimeFrameSize);
     delay(kSpiReplyPollDelayMs);
@@ -368,10 +383,10 @@ void printSpiTransferSummary(const char *label, const char *payload, const SpiAc
  * Executes one predefined timestamp transfer test and prints both the generic
  * reply line and the labeled transfer summary.
  */
-void sendTimestampTestCase(const char *label, const char *timestamp)
+void sendTimestampTestCase(const char *label, const char *timestamp, uint8_t utcOffsetStatus)
 {
     const uint8_t sequenceId = allocateSequenceId();
-    const SpiAck ack = sendTimeToTeensy(timestamp, false, sequenceId);
+    const SpiAck ack = sendTimeToTeensy(timestamp, false, sequenceId, utcOffsetStatus);
     printSpiReply(ack, sequenceId);
     printSpiTransferSummary(label, timestamp, ack);
 }
@@ -410,7 +425,8 @@ void printSpiTestHelp()
     Serial.println("  test <name>  - run one canned test");
     Serial.println("  invalid      - send bad frame terminator test");
     Serial.println("  send <stamp> - send explicit YYYY-MM-DD HH:MM:SS");
-    Serial.println("Tests: winter, summer, dst-start-before, dst-start-at, dst-end-before, dst-end-at, invalid-date, invalid-format");
+    Serial.println("Tests: winter, summer, dst-start-before, dst-start-at, dst-end-cest-0159/0200/0230/0259,");
+    Serial.println("       dst-end-cet-0200/0230/0259/0300, invalid-date, invalid-format");
 }
 
 /**
@@ -424,7 +440,10 @@ bool runNamedTimestampTest(const char *testName)
     {
         if (strcmp(testName, kSpiTimestampTests[i].name) == 0)
         {
-            sendTimestampTestCase(kSpiTimestampTests[i].name, kSpiTimestampTests[i].timestamp);
+            sendTimestampTestCase(
+                kSpiTimestampTests[i].name,
+                kSpiTimestampTests[i].timestamp,
+                kSpiTimestampTests[i].utcOffsetStatus);
             return true;
         }
     }
@@ -442,7 +461,10 @@ void runSpiTestSuite()
 
     for (size_t i = 0; i < kSpiTimestampTestCount; ++i)
     {
-        sendTimestampTestCase(kSpiTimestampTests[i].name, kSpiTimestampTests[i].timestamp);
+        sendTimestampTestCase(
+            kSpiTimestampTests[i].name,
+            kSpiTimestampTests[i].timestamp,
+            kSpiTimestampTests[i].utcOffsetStatus);
         delay(kSpiTestStepDelayMs);
     }
 
@@ -499,7 +521,8 @@ bool isTimePlausible(const tm &timeinfo)
            timeinfo.tm_mday >= 1 && timeinfo.tm_mday <= 31 &&
            timeinfo.tm_hour >= 0 && timeinfo.tm_hour <= 23 &&
            timeinfo.tm_min >= 0 && timeinfo.tm_min <= 59 &&
-           timeinfo.tm_sec >= 0 && timeinfo.tm_sec <= 59;
+           timeinfo.tm_sec >= 0 && timeinfo.tm_sec <= 59 &&
+           timeinfo.tm_isdst >= 0;
 }
 
 /**
@@ -639,7 +662,14 @@ bool printTransferTime(const tm &timeinfo, bool ntpSynchronized, uint8_t sequenc
 {
     char transferBuffer[20];
     formatTransferTimestamp(timeinfo, transferBuffer, sizeof(transferBuffer));
-    const SpiAck ack = sendTimeToTeensy(transferBuffer, ntpSynchronized, sequenceId);
+    const uint8_t utcOffsetStatus = timeinfo.tm_isdst > 0
+        ? kUtcOffsetStatusCest
+        : kUtcOffsetStatusCet;
+    const SpiAck ack = sendTimeToTeensy(
+        transferBuffer,
+        ntpSynchronized,
+        sequenceId,
+        utcOffsetStatus);
     printSpiReply(ack, sequenceId);
 
     Serial.print("TIME_TX: ");
@@ -874,7 +904,7 @@ void handleSerialCommands()
 
     if (strncmp(command, kSendPrefix, kSendPrefixLength) == 0)
     {
-        sendTimestampTestCase("manual", command + kSendPrefixLength);
+        sendTimestampTestCase("manual", command + kSendPrefixLength, 0x00);
         return;
     }
 
