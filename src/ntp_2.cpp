@@ -10,6 +10,7 @@
 */
 
 #include <WiFi.h>
+#include <esp_sntp.h>
 #include <string.h>
 #include "time.h"
 #include "credential.h"
@@ -29,6 +30,11 @@ constexpr unsigned int kSpiHalfClockDelayUs = 500;
 constexpr unsigned long kSpiCsSetupDelayUs = 20000;
 constexpr size_t kSpiTimeFrameSize = 32;
 constexpr size_t kSpiTimeTextLength = 19;
+constexpr size_t kSpiNtpStatusIndex = 20;
+constexpr size_t kSpiSequenceIndex = 21;
+constexpr uint8_t kNtpStatusFailed = 0x00;
+constexpr uint8_t kNtpStatusSynchronized = 0x01;
+constexpr unsigned long kNtpServerAttemptTimeoutMs = 2000;
 constexpr char kSpiStatusPollMarker[] = "STATUS?";
 constexpr size_t kSpiStatusPollMarkerLength = sizeof(kSpiStatusPollMarker) - 1;
 constexpr unsigned long kSpiReplyPollDelayMs = 30;
@@ -53,9 +59,21 @@ const size_t kNtpServerCount = sizeof(kNtpServers) / sizeof(kNtpServers[0]);
 
 const char *activeNtpServer = nullptr;
 bool timeSynced = false;
+volatile bool ntpSyncCompleted = false;
+bool currentMinuteNtpSynchronized = false;
 unsigned long lastNtpSyncAttemptMs = 0;
 unsigned long lastPrintMs = 0;
 uint32_t lastTransferredMinuteStamp = kInvalidMinuteStamp;
+uint32_t lastNtpAttemptMinuteStamp = kInvalidMinuteStamp;
+uint32_t currentTimeFrameMinuteStamp = kInvalidMinuteStamp;
+uint8_t nextSequenceId = 0;
+uint8_t currentTimeFrameSequenceId = 0;
+
+struct SpiAck
+{
+    uint8_t status;
+    uint8_t sequence;
+};
 
 struct SpiTimestampTestCase
 {
@@ -102,8 +120,16 @@ const char *spiReplyLabel(uint8_t replyCode)
     }
 }
 
-uint8_t transferFrameToTeensy(const uint8_t *frame, size_t frameSize);
-uint8_t pollTeensyReply();
+void transferFrameToTeensy(const uint8_t *frame, size_t frameSize, SpiAck *receivedAck = nullptr);
+SpiAck pollTeensyReply();
+void formatTransferTimestamp(const tm &timeinfo, char *buffer, size_t bufferSize);
+
+uint8_t allocateSequenceId()
+{
+    const uint8_t allocatedSequence = nextSequenceId;
+    ++nextSequenceId;
+    return allocatedSequence;
+}
 
 /**
  * Writes a byte as two uppercase hexadecimal digits to the serial monitor.
@@ -207,11 +233,15 @@ void beginTeensySpi()
  * The returned byte is the status-poll result, not merely the last byte seen
  * during the payload transfer.
  */
-uint8_t sendTimeToTeensy(const char *timestamp)
+SpiAck sendTimeToTeensy(const char *timestamp, bool ntpSynchronized, uint8_t sequenceId)
 {
     uint8_t frame[kSpiTimeFrameSize] = {};
     copyBoundedTextToFrame(frame, sizeof(frame), timestamp, kSpiTimeTextLength);
     frame[kSpiTimeTextLength] = '\0';
+    frame[kSpiNtpStatusIndex] = ntpSynchronized
+        ? kNtpStatusSynchronized
+        : kNtpStatusFailed;
+    frame[kSpiSequenceIndex] = sequenceId;
 
     transferFrameToTeensy(frame, kSpiTimeFrameSize);
     delay(kSpiReplyPollDelayMs);
@@ -221,60 +251,96 @@ uint8_t sendTimeToTeensy(const char *timestamp)
 /**
  * Transfers a complete frame with manual chip-select handling.
  *
- * The function returns the last byte sampled from MISO during that transfer.
- * Callers interpret that byte according to context.
+ * When requested, the first two simultaneously received bytes are captured as
+ * the status and sequence fields of the Teensy's ACK response.
  */
-uint8_t transferFrameToTeensy(const uint8_t *frame, size_t frameSize)
+void transferFrameToTeensy(const uint8_t *frame, size_t frameSize, SpiAck *receivedAck)
 {
     if (frame == nullptr || frameSize == 0)
     {
-        return 0x00;
+        return;
     }
 
-    uint8_t lastReceivedByte = 0;
     digitalWrite(kSpiCsPin, LOW);
     delayMicroseconds(kSpiCsSetupDelayUs);
 
     for (size_t byteIndex = 0; byteIndex < frameSize; ++byteIndex)
     {
-        lastReceivedByte = transferByteToTeensy(frame[byteIndex]);
+        const uint8_t receivedByte = transferByteToTeensy(frame[byteIndex]);
+        if (receivedAck != nullptr)
+        {
+            if (byteIndex == 0)
+            {
+                receivedAck->status = receivedByte;
+            }
+            else if (byteIndex == 1)
+            {
+                receivedAck->sequence = receivedByte;
+            }
+        }
     }
 
     digitalWrite(kSpiClkPin, LOW);
     digitalWrite(kSpiCsPin, HIGH);
 
-    return lastReceivedByte;
 }
 
 /**
  * Sends the dedicated `STATUS?` poll frame and returns the Teensy's currently
- * latched one-byte status code.
+ * latched status code together with the related sequence ID.
  */
-uint8_t pollTeensyReply()
+SpiAck pollTeensyReply()
 {
     uint8_t pollFrame[kSpiTimeFrameSize] = {};
+    SpiAck ack = {};
     memcpy(pollFrame, kSpiStatusPollMarker, kSpiStatusPollMarkerLength);
     pollFrame[kSpiStatusPollMarkerLength] = '\0';
-    return transferFrameToTeensy(pollFrame, kSpiTimeFrameSize);
+    transferFrameToTeensy(pollFrame, kSpiTimeFrameSize, &ack);
+    return ack;
 }
 
 /**
  * Prints one SPI reply byte in the canonical debug format used throughout the
  * project and by the GUI tooling.
  */
-void printSpiReply(uint8_t spiReply)
+void printSpiReply(const SpiAck &ack, uint8_t sentSequence)
 {
     Serial.print("SPI reply: 0x");
-    printHexByte(spiReply);
+    printHexByte(ack.status);
     Serial.print(' ');
-    Serial.println(spiReplyLabel(spiReply));
+    Serial.println(spiReplyLabel(ack.status));
+    Serial.print("TX sequence: ");
+    Serial.println(sentSequence);
+    Serial.print("ACK status: 0x");
+    printHexByte(ack.status);
+    Serial.println();
+    Serial.print("ACK sequence: ");
+    Serial.println(ack.sequence);
+
+    if (ack.status == 0x01 && ack.sequence == sentSequence)
+    {
+        Serial.println("ACK OK");
+    }
+    else if (ack.sequence != sentSequence)
+    {
+        Serial.println("ACK sequence mismatch");
+    }
+    else
+    {
+        Serial.println("ACK not accepted");
+    }
+}
+
+bool isAcceptedAck(const SpiAck &ack, uint8_t sentSequence)
+{
+    return ack.status == 0x01 && ack.sequence == sentSequence;
 }
 
 /**
  * Prints a labeled one-line transfer summary that includes the payload and the
  * final acknowledgement code.
  */
-void printSpiTransferSummary(const char *label, const char *payload, uint8_t spiReply)
+void printSpiTransferSummary(const char *label, const char *payload, const SpiAck &ack)
 {
     Serial.print("SPI TX");
     if (label != nullptr && label[0] != '\0')
@@ -291,9 +357,11 @@ void printSpiTransferSummary(const char *label, const char *payload, uint8_t spi
     }
 
     Serial.print(" | ACK=0x");
-    printHexByte(spiReply);
+    printHexByte(ack.status);
     Serial.print(' ');
-    Serial.println(spiReplyLabel(spiReply));
+    Serial.print(spiReplyLabel(ack.status));
+    Serial.print(" | ACK_SEQ=");
+    Serial.println(ack.sequence);
 }
 
 /**
@@ -302,9 +370,10 @@ void printSpiTransferSummary(const char *label, const char *payload, uint8_t spi
  */
 void sendTimestampTestCase(const char *label, const char *timestamp)
 {
-    const uint8_t spiReply = sendTimeToTeensy(timestamp);
-    printSpiReply(spiReply);
-    printSpiTransferSummary(label, timestamp, spiReply);
+    const uint8_t sequenceId = allocateSequenceId();
+    const SpiAck ack = sendTimeToTeensy(timestamp, false, sequenceId);
+    printSpiReply(ack, sequenceId);
+    printSpiTransferSummary(label, timestamp, ack);
 }
 
 /**
@@ -318,12 +387,14 @@ void sendInvalidTerminatorFrame()
 
     copyBoundedTextToFrame(frame, sizeof(frame), timestamp, kSpiTimeTextLength);
     frame[kSpiTimeTextLength] = 'X';
+    const uint8_t sequenceId = allocateSequenceId();
+    frame[kSpiSequenceIndex] = sequenceId;
 
     transferFrameToTeensy(frame, sizeof(frame));
     delay(kSpiReplyPollDelayMs);
-    const uint8_t spiReply = pollTeensyReply();
-    printSpiReply(spiReply);
-    printSpiTransferSummary("invalid-terminator", "2026-01-15 12:00:00 + bad byte[19]", spiReply);
+    const SpiAck ack = pollTeensyReply();
+    printSpiReply(ack, sequenceId);
+    printSpiTransferSummary("invalid-terminator", "2026-01-15 12:00:00 + bad byte[19]", ack);
 }
 
 /**
@@ -416,16 +487,6 @@ bool connectToWifi()
 }
 
 /**
- * Disconnects from Wi-Fi and powers the radio down to minimize idle activity
- * after time sync has completed.
- */
-void disconnectWifi()
-{
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-}
-
-/**
  * Performs coarse plausibility checks on a `tm` structure before the rest of
  * the program formats or transfers it.
  */
@@ -463,6 +524,16 @@ bool readValidatedLocalTime(tm &timeinfo)
 }
 
 /**
+ * Records completion of an actual SNTP update. Reading the ESP32 system clock
+ * alone is insufficient because it keeps running when no NTP server responds.
+ */
+void onNtpTimeSynchronized(struct timeval *timeValue)
+{
+    (void)timeValue;
+    ntpSyncCompleted = true;
+}
+
+/**
  * Configures one NTP server together with the Berlin time zone rule set and
  * accepts the server only if a valid local time sample is returned.
  */
@@ -473,9 +544,16 @@ bool syncTimeFromServer(const char *server)
     Serial.print("NTP try: ");
     Serial.println(server);
 
+    ntpSyncCompleted = false;
     configTzTime(kBerlinTimeZone, server);
 
-    if (!readValidatedLocalTime(timeinfo))
+    const unsigned long attemptStartMs = millis();
+    while (!ntpSyncCompleted && millis() - attemptStartMs < kNtpServerAttemptTimeoutMs)
+    {
+        delay(10);
+    }
+
+    if (!ntpSyncCompleted || !readValidatedLocalTime(timeinfo))
     {
         return false;
     }
@@ -499,10 +577,47 @@ bool syncTimeFromNtpServers()
         }
     }
 
-    Serial.print("NTP failed, retry in ");
-    Serial.print(kNtpRetryIntervalMs / 1000);
-    Serial.println("s");
     return false;
+}
+
+/**
+ * Performs one real NTP synchronization attempt while keeping Wi-Fi available
+ * for the next minute. Failure leaves the continuously running system clock
+ * untouched and available for transfer.
+ */
+bool performNtpSyncAttempt()
+{
+    Serial.println("NTP sync started");
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("WiFi reconnect...");
+        if (!connectToWifi())
+        {
+            Serial.println("NTP sync failed - using system time");
+            return false;
+        }
+    }
+
+    if (!syncTimeFromNtpServers())
+    {
+        Serial.println("NTP sync failed - using system time");
+        return false;
+    }
+
+    tm timeinfo;
+    if (!readValidatedLocalTime(timeinfo))
+    {
+        Serial.println("NTP sync failed - using system time");
+        return false;
+    }
+
+    char timeBuffer[20];
+    formatTransferTimestamp(timeinfo, timeBuffer, sizeof(timeBuffer));
+    Serial.println("NTP sync successful");
+    Serial.print("NTP time: ");
+    Serial.println(timeBuffer);
+    return true;
 }
 
 /**
@@ -520,31 +635,38 @@ void formatTransferTimestamp(const tm &timeinfo, char *buffer, size_t bufferSize
  *
  * Returns `true` only when the Teensy acknowledges the update with `0x01`.
  */
-bool printTransferTime(const tm &timeinfo)
+bool printTransferTime(const tm &timeinfo, bool ntpSynchronized, uint8_t sequenceId)
 {
     char transferBuffer[20];
     formatTransferTimestamp(timeinfo, transferBuffer, sizeof(transferBuffer));
-    const uint8_t spiReply = sendTimeToTeensy(transferBuffer);
-    printSpiReply(spiReply);
+    const SpiAck ack = sendTimeToTeensy(transferBuffer, ntpSynchronized, sequenceId);
+    printSpiReply(ack, sequenceId);
 
     Serial.print("TIME_TX: ");
     Serial.print(transferBuffer);
     Serial.print(" | SPI CS=");
     Serial.print(kSpiCsPin);
     Serial.print(" | ACK=0x");
-    printHexByte(spiReply);
+    printHexByte(ack.status);
     Serial.print(' ');
-    Serial.print(spiReplyLabel(spiReply));
+    Serial.print(spiReplyLabel(ack.status));
+    Serial.print(" | SEQ=");
+    Serial.print(sequenceId);
+    Serial.print(" | ACK_SEQ=");
+    Serial.print(ack.sequence);
 
-    if (activeNtpServer != nullptr)
+    Serial.print(" | NTP: ");
+    Serial.print(ntpSynchronized ? "OK" : "FAIL");
+
+    if (ntpSynchronized && activeNtpServer != nullptr)
     {
         Serial.print(" | SRC: ");
         Serial.println(activeNtpServer);
-        return spiReply == 0x01;
+        return isAcceptedAck(ack, sequenceId);
     }
 
     Serial.println();
-    return spiReply == 0x01;
+    return isAcceptedAck(ack, sequenceId);
 }
 
 /**
@@ -615,11 +737,31 @@ void serviceCurrentTime(bool forceTransfer = false)
         return;
     }
 
-    const uint32_t currentMinuteStamp = buildMinuteStamp(timeinfo);
+    uint32_t currentMinuteStamp = buildMinuteStamp(timeinfo);
+    bool minuteSyncAttempted = false;
 
-    if (shouldTransferCurrentMinute(currentMinuteStamp, forceTransfer))
+    if (!forceTransfer && currentMinuteStamp != lastNtpAttemptMinuteStamp)
     {
-        if (printTransferTime(timeinfo))
+        minuteSyncAttempted = true;
+        lastNtpAttemptMinuteStamp = currentMinuteStamp;
+        currentMinuteNtpSynchronized = performNtpSyncAttempt();
+
+        if (readValidatedLocalTime(timeinfo))
+        {
+            currentMinuteStamp = buildMinuteStamp(timeinfo);
+            lastNtpAttemptMinuteStamp = currentMinuteStamp;
+        }
+    }
+
+    if (shouldTransferCurrentMinute(currentMinuteStamp, forceTransfer || minuteSyncAttempted))
+    {
+        if (forceTransfer || minuteSyncAttempted || currentMinuteStamp != currentTimeFrameMinuteStamp)
+        {
+            currentTimeFrameSequenceId = allocateSequenceId();
+            currentTimeFrameMinuteStamp = currentMinuteStamp;
+        }
+
+        if (printTransferTime(timeinfo, currentMinuteNtpSynchronized, currentTimeFrameSequenceId))
         {
             lastTransferredMinuteStamp = currentMinuteStamp;
         }
@@ -758,22 +900,18 @@ void handleTimeSync(unsigned long now)
 
     lastNtpSyncAttemptMs = now;
 
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        Serial.println("WiFi reconnect...");
-        if (!connectToWifi())
-        {
-            return;
-        }
-    }
-
     Serial.println("NTP retry...");
-    timeSynced = syncTimeFromNtpServers();
+    timeSynced = performNtpSyncAttempt();
 
     if (timeSynced)
     {
+        currentMinuteNtpSynchronized = true;
+        tm timeinfo;
+        if (readValidatedLocalTime(timeinfo))
+        {
+            lastNtpAttemptMinuteStamp = buildMinuteStamp(timeinfo);
+        }
         serviceCurrentTime(true);
-        disconnectWifi();
     }
 }
 
@@ -785,17 +923,20 @@ void setup()
     Serial.begin(115200);
     beginTeensySpi();
     printSpiTestHelp();
+    sntp_set_time_sync_notification_cb(onNtpTimeSynchronized);
 
     lastNtpSyncAttemptMs = millis() - kNtpRetryIntervalMs;
-    if (connectToWifi())
-    {
-        timeSynced = syncTimeFromNtpServers();
-    }
+    timeSynced = performNtpSyncAttempt();
 
     if (timeSynced)
     {
+        currentMinuteNtpSynchronized = true;
+        tm timeinfo;
+        if (readValidatedLocalTime(timeinfo))
+        {
+            lastNtpAttemptMinuteStamp = buildMinuteStamp(timeinfo);
+        }
         serviceCurrentTime(true);
-        disconnectWifi();
     }
 }
 
